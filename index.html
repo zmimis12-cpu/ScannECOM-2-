@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>DIGYLOG Scanner Mobile</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://unpkg.com/@zxing/library@0.19.1/umd/index.min.js"></script>
+    <style>
+        body {
+            overscroll-behavior: none;
+            -webkit-overflow-scrolling: touch;
+        }
+        .animate-bounce-slow {
+            animation: bounce 2s infinite;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .fade-in {
+            animation: fadeIn 0.3s ease-out;
+        }
+        @keyframes scanLine {
+            0%, 100% { top: 0; }
+            50% { top: 100%; }
+        }
+        .scan-line {
+            animation: scanLine 2s ease-in-out infinite;
+        }
+        video {
+            object-fit: cover;
+        }
+        .viewfinder {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80%;
+            max-width: 400px;
+            aspect-ratio: 3/2;
+            border: 3px solid #22c55e;
+            border-radius: 12px;
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+        }
+        .corner {
+            position: absolute;
+            width: 30px;
+            height: 30px;
+            border: 4px solid #22c55e;
+        }
+        .corner-tl { top: -2px; left: -2px; border-right: none; border-bottom: none; }
+        .corner-tr { top: -2px; right: -2px; border-left: none; border-bottom: none; }
+        .corner-bl { bottom: -2px; left: -2px; border-right: none; border-top: none; }
+        .corner-br { bottom: -2px; right: -2px; border-left: none; border-top: none; }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-indigo-900 via-purple-900 to-blue-900 min-h-screen">
+    <div id="app"></div>
+
+    <script>
+        // Configuration PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        // État de l'application
+        let state = {
+            referenceOrders: [],
+            scannedOrders: new Set(),
+            uploadedFiles: [],
+            currentView: 'import',
+            scanMode: 'keyboard',
+            scanInput: '',
+            lastScanned: '',
+            isProcessing: false,
+            dragActive: false,
+            isCameraActive: false,
+            cameraStream: null,
+            codeReader: null,
+            scanBuffer: '',
+            lastKeyTime: 0,
+            continuousScan: true,
+            douchetteMode: true,
+            storeGroups: {},
+            scanQueue: []
+        };
+
+        // Fonction pour afficher une notification
+        function showNotification(message, type) {
+            const notifDiv = document.createElement('div');
+            notifDiv.className = `fixed top-4 right-4 z-50 px-6 py-4 rounded-lg shadow-2xl text-white font-bold text-lg animate-bounce ${
+                type === 'success' ? 'bg-green-500' :
+                type === 'warning' ? 'bg-orange-500' :
+                'bg-red-500'
+            }`;
+            notifDiv.textContent = message;
+            document.body.appendChild(notifDiv);
+            
+            setTimeout(() => {
+                notifDiv.remove();
+            }, 2000);
+        }
+
+        // Fonction pour jouer un son amélioré avec différents types
+        function playSound(type) {
+            try {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                if (type === 'success') {
+                    // Son de succès : tonalité montante claire (bip caisse)
+                    oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+                    oscillator.frequency.exponentialRampToValueAtTime(1000, audioContext.currentTime + 0.15);
+                    oscillator.type = 'sine';
+                    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
+                    oscillator.start(audioContext.currentTime);
+                    oscillator.stop(audioContext.currentTime + 0.2);
+                } else if (type === 'duplicate') {
+                    // Son doublon : double bip (bip-bip)
+                    oscillator.frequency.value = 600;
+                    oscillator.type = 'square';
+                    gainNode.gain.setValueAtTime(0.2, audioContext.currentTime);
+                    gainNode.gain.setValueAtTime(0, audioContext.currentTime + 0.08);
+                    gainNode.gain.setValueAtTime(0.2, audioContext.currentTime + 0.12);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.25);
+                    oscillator.start(audioContext.currentTime);
+                    oscillator.stop(audioContext.currentTime + 0.25);
+                } else if (type === 'error') {
+                    // Son erreur : tonalité descendante grave (boup)
+                    oscillator.frequency.setValueAtTime(400, audioContext.currentTime);
+                    oscillator.frequency.exponentialRampToValueAtTime(200, audioContext.currentTime + 0.3);
+                    oscillator.type = 'sawtooth';
+                    gainNode.gain.setValueAtTime(0.25, audioContext.currentTime);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+                    oscillator.start(audioContext.currentTime);
+                    oscillator.stop(audioContext.currentTime + 0.3);
+                }
+            } catch (error) {
+                console.log('Audio not available');
+            }
+        }
+
+        // Fonction playBeep mise à jour pour utiliser le nouveau système
+        function playBeep(frequency = 800, duration = 0.1) {
+            if (frequency === 800) playSound('success');
+            else if (frequency === 600) playSound('duplicate');
+            else playSound('error');
+        }
+
+        // Extraire le texte d'un PDF
+        async function extractTextFromPDF(arrayBuffer) {
+            const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+            const pdf = await loadingTask.promise;
+            let fullText = '';
+
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+                const pageText = textContent.items.map(item => item.str).join(' ');
+                fullText += pageText + '\n';
+            }
+
+            return fullText;
+        }
+
+        // Extraire les informations structurées d'un ticket
+        function extractTicketInfo(text) {
+            const info = {
+                store_name: "",
+                quantity: "",
+                product_name: "",
+                price: "",
+                destination_city: "",
+                receiver_name: ""
+            };
+
+            const lines = text.split('\n').map(line => line.trim());
+
+            // Extraire le store_name (après "Expéditeur :")
+            for (let line of lines) {
+                const expediteurMatch = line.match(/Expéditeur\s*:\s*(?:\[\d+\]\s*[-–]?\s*)?(.+?)(?:\s*\[|$)/i);
+                if (expediteurMatch) {
+                    info.store_name = expediteurMatch[1].trim().replace(/^[-–]\s*/, '');
+                    break;
+                }
+            }
+
+            // Extraire quantity et product_name (format: "1x Produit" ou "1 x Produit")
+            for (let line of lines) {
+                const quantityMatch = line.match(/(\d+)\s*x\s*(.+?)(?:\s+\d+\s*DH|$)/i);
+                if (quantityMatch) {
+                    info.quantity = quantityMatch[1];
+                    info.product_name = quantityMatch[2].trim();
+                    break;
+                }
+            }
+
+            // Extraire le price (format: "349 DH" ou "349DH")
+            for (let line of lines) {
+                const priceMatch = line.match(/(\d+(?:[.,]\d{2})?)\s*DH/i);
+                if (priceMatch) {
+                    info.price = priceMatch[1] + ' DH';
+                    break;
+                }
+            }
+
+            // Extraire destination_city (villes marocaines courantes)
+            const moroccanCities = [
+                'Casablanca', 'Casa', 'Rabat', 'Marrakech', 'Fes', 'Fès', 'Tanger', 'Tangier',
+                'Agadir', 'Meknès', 'Meknes', 'Oujda', 'Kenitra', 'Tétouan', 'Tetouan',
+                'Safi', 'Mohammedia', 'Khouribga', 'Beni Mellal', 'El Jadida', 'Nador',
+                'Settat', 'Larache', 'Khemisset', 'Guelmim', 'Berrechid', 'Errachidia',
+                'Ksar El Kebir', 'Sale', 'Salé', 'Taza', 'Essaouira', 'Ouarzazate'
+            ];
+
+            for (let line of lines) {
+                for (let city of moroccanCities) {
+                    if (line.toLowerCase().includes(city.toLowerCase())) {
+                        info.destination_city = city;
+                        break;
+                    }
+                }
+                if (info.destination_city) break;
+            }
+
+            // Extraire receiver_name (chercher après "Destinataire" ou "Client" ou patterns de noms)
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                
+                // Chercher après "Destinataire :" ou "Client :"
+                const receiverMatch = line.match(/(?:Destinataire|Client)\s*:\s*(.+)/i);
+                if (receiverMatch) {
+                    info.receiver_name = receiverMatch[1].trim().split(/\s+/).slice(0, 2).join(' ');
+                    break;
+                }
+                
+                // Si on trouve une ligne avec juste un nom (2-3 mots capitalisés)
+                const nameMatch = line.match(/^([A-Z][a-zàâäéèêëïîôùûü]+(?:\s+[A-Z][a-zàâäéèêëïîôùûü]+){1,2})$/);
+                if (nameMatch && line.length > 3 && line.length < 40) {
+                    // Vérifier que ce n'est pas une ville ou un produit
+                    if (!moroccanCities.some(city => line.toLowerCase().includes(city.toLowerCase()))) {
+                        info.receiver_name = nameMatch[1];
+                    }
+                }
+            }
+
+            return info;
+        }
+
+        // Extraire les codes de suivi
+        function extractTrackingCodes(text) {
+            const pattern = /[A-Z]\d{7}[A-Z]{2}/g;
+            const matches = text.match(pattern);
+            return matches ? [...new Set(matches)] : [];
+        }
+
+        // Extraire les informations complètes des tickets SANS DOUBLONS
+        function extractOrdersWithDetails(text) {
+            const orders = [];
+            const seenCodes = new Set(); // Pour éviter les doublons
+            
+            // Diviser le texte en sections par code de suivi
+            const sections = text.split(/(?=[A-Z]\d{7}[A-Z]{2})/);
+            
+            for (let section of sections) {
+                const codeMatch = section.match(/[A-Z]\d{7}[A-Z]{2}/);
+                if (codeMatch) {
+                    const code = codeMatch[0];
+                    
+                    // IGNORER si le code existe déjà
+                    if (seenCodes.has(code)) {
+                        console.log(`⚠️ Code dupliqué ignoré: ${code}`);
+                        continue;
+                    }
+                    
+                    seenCodes.add(code);
+                    const ticketInfo = extractTicketInfo(section);
+                    
+                    orders.push({
+                        tracking: code,
+                        barcode: code,
+                        ...ticketInfo,
+                        scanned: false,
+                        id: Date.now() + Math.random()
+                    });
+                }
+            }
+
+            console.log(`✅ ${orders.length} commandes uniques extraites (${seenCodes.size} codes uniques)`);
+            return orders;
+        }
+
+        // Gérer l'import de fichiers avec extraction détaillée SANS DOUBLONS
+        async function handleFiles(files) {
+            if (!files || files.length === 0) return;
+
+            state.isProcessing = true;
+            render();
+
+            const allOrders = [];
+            const allCodes = new Set(); // Pour éviter les doublons entre fichiers
+            const processedFiles = [];
+
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                try {
+                    let orders = [];
+                    
+                    if (file.type === 'application/pdf') {
+                        const arrayBuffer = await file.arrayBuffer();
+                        const text = await extractTextFromPDF(arrayBuffer);
+                        orders = extractOrdersWithDetails(text);
+                    } else if (file.type === 'text/csv' || file.name.endsWith('.csv')) {
+                        const text = await file.text();
+                        const codes = text.split(/[\n,]/).map(code => code.trim()).filter(code => /[A-Z]\d{7}[A-Z]{2}/.test(code));
+                        // Supprimer les doublons dans le CSV
+                        const uniqueCodes = [...new Set(codes)];
+                        orders = uniqueCodes.map(code => ({
+                            tracking: code,
+                            barcode: code,
+                            store_name: "",
+                            quantity: "",
+                            product_name: "",
+                            price: "",
+                            destination_city: "",
+                            receiver_name: "",
+                            scanned: false,
+                            id: Date.now() + Math.random()
+                        }));
+                    } else if (file.type === 'text/plain') {
+                        const text = await file.text();
+                        const codes = text.split(/[\n,\s]/).map(code => code.trim()).filter(code => /[A-Z]\d{7}[A-Z]{2}/.test(code));
+                        // Supprimer les doublons dans le TXT
+                        const uniqueCodes = [...new Set(codes)];
+                        orders = uniqueCodes.map(code => ({
+                            tracking: code,
+                            barcode: code,
+                            store_name: "",
+                            quantity: "",
+                            product_name: "",
+                            price: "",
+                            destination_city: "",
+                            receiver_name: "",
+                            scanned: false,
+                            id: Date.now() + Math.random()
+                        }));
+                    }
+
+                    // Filtrer les commandes déjà présentes
+                    const newOrders = orders.filter(order => {
+                        if (allCodes.has(order.tracking)) {
+                            console.log(`⚠️ Code dupliqué entre fichiers ignoré: ${order.tracking}`);
+                            return false;
+                        }
+                        allCodes.add(order.tracking);
+                        return true;
+                    });
+
+                    allOrders.push(...newOrders);
+                    processedFiles.push({ name: file.name, count: newOrders.length });
+                } catch (error) {
+                    console.error(`Erreur avec ${file.name}:`, error);
+                }
+            }
+
+            // Regrouper par store (expéditeur)
+            const storeGroups = {};
+            allOrders.forEach(order => {
+                const store = order.store_name || 'Non identifié';
+                if (!storeGroups[store]) {
+                    storeGroups[store] = [];
+                }
+                storeGroups[store].push(order);
+            });
+
+            state.storeGroups = storeGroups;
+            state.referenceOrders = allOrders.map(o => o.tracking);
+            state.uploadedFiles = processedFiles;
+            state.isProcessing = false;
+            
+            const totalCodes = allOrders.length;
+            const storeCount = Object.keys(storeGroups).length;
+            showNotification(`✅ ${totalCodes} commandes uniques importées de ${storeCount} expéditeur(s)`, 'success');
+            
+            console.log('📦 Données extraites (sans doublons):', { 
+                total: allOrders.length, 
+                orders: allOrders, 
+                stores: storeGroups 
+            });
+            render();
+        }
+
+        // Charger des données d'exemple
+        function loadSampleData() {
+            const sampleOrders = [
+                { tracking: 'S4906834EA', barcode: 'S4906834EA', store_name: 'idealshop', quantity: '1', product_name: 'Sécateur Télescopique', price: '349 DH', destination_city: 'Fes', receiver_name: 'Senhaji', scanned: false, id: 1 },
+                { tracking: 'T3847562FR', barcode: 'T3847562FR', store_name: 'techstore', quantity: '2', product_name: 'Câble HDMI', price: '89 DH', destination_city: 'Casablanca', receiver_name: 'Alami', scanned: false, id: 2 },
+                { tracking: 'R2938475MC', barcode: 'R2938475MC', store_name: 'idealshop', quantity: '1', product_name: 'Kit Jardinage', price: '199 DH', destination_city: 'Rabat', receiver_name: 'Bennani', scanned: false, id: 3 },
+                { tracking: 'P5629384TA', barcode: 'P5629384TA', store_name: 'fashionshop', quantity: '3', product_name: 'T-Shirt Coton', price: '150 DH', destination_city: 'Marrakech', receiver_name: 'Tazi', scanned: false, id: 4 },
+                { tracking: 'Q7483920AG', barcode: 'Q7483920AG', store_name: 'techstore', quantity: '1', product_name: 'Souris Sans Fil', price: '79 DH', destination_city: 'Tanger', receiver_name: 'Idrissi', scanned: false, id: 5 }
+            ];
+
+            // Regrouper par store
+            const storeGroups = {};
+            sampleOrders.forEach(order => {
+                const store = order.store_name;
+                if (!storeGroups[store]) {
+                    storeGroups[store] = [];
+                }
+                storeGroups[store].push(order);
+            });
+
+            state.referenceOrders = sampleOrders.map(o => o.tracking);
+            state.scannedOrders = new Set();
+            state.storeGroups = storeGroups;
+            state.uploadedFiles = [{ name: 'Données d\'exemple', count: sampleOrders.length }];
+            
+            showNotification(`✅ ${sampleOrders.length} commandes d'exemple`, 'success');
+            console.log('📦 Exemple de données:', { orders: sampleOrders, stores: storeGroups });
+            render();
+        }
+
+        // Gérer le scan
+        function handleScan(code) {
+            const cleanCode = code.trim().toUpperCase();
+            
+            if (!cleanCode || !/[A-Z]\d{7}[A-Z]{2}/.test(cleanCode)) {
+                return;
+            }
+
+            if (state.scannedOrders.has(cleanCode)) {
+                showNotification('⚠️ Ce ticket a déjà été scanné', 'warning');
+                state.lastScanned = cleanCode;
+                playSound('duplicate');
+                render();
+                return;
+            }
+
+            if (!state.referenceOrders.includes(cleanCode)) {
+                showNotification('❌ Identifiant non trouvé', 'error');
+                playSound('error');
+                return;
+            }
+
+            state.scannedOrders.add(cleanCode);
+            state.lastScanned = cleanCode;
+            showNotification('✅ Ticket scanné avec succès', 'success');
+            playSound('success');
+            render();
+        }
+
+        // Gérer le scan avec détection automatique de lecteur code-barres
+        function initBarcodeScanner() {
+            let buffer = '';
+            let timeout = null;
+
+            document.addEventListener('keypress', function(e) {
+                // Ignorer si pas en mode scan
+                if (state.currentView !== 'scan' || state.scanMode !== 'keyboard') {
+                    return;
+                }
+
+                const currentTime = new Date().getTime();
+                
+                // Si le délai entre 2 touches est < 50ms, c'est un scanner (pas un humain)
+                if (currentTime - state.lastKeyTime < 50) {
+                    // C'est un scanner, accumuler les caractères
+                    if (e.key === 'Enter') {
+                        // Fin du scan
+                        if (buffer.length >= 10) {
+                            console.log('📦 Scanner détecté, code complet:', buffer);
+                            handleScan(buffer);
+                            
+                            // Afficher dans le champ aussi
+                            const input = document.getElementById('scanInput');
+                            if (input) {
+                                input.value = buffer;
+                            }
+                        }
+                        buffer = '';
+                    } else {
+                        buffer += e.key;
+                    }
+                } else {
+                    // Reset si trop lent (frappe humaine)
+                    buffer = e.key;
+                }
+                
+                state.lastKeyTime = currentTime;
+
+                // Sécurité : vider le buffer après 200ms
+                if (timeout) clearTimeout(timeout);
+                timeout = setTimeout(() => {
+                    if (buffer.length >= 10) {
+                        console.log('📦 Code détecté (timeout):', buffer);
+                        handleScan(buffer);
+                        
+                        const input = document.getElementById('scanInput');
+                        if (input) {
+                            input.value = buffer;
+                        }
+                    }
+                    buffer = '';
+                }, 200);
+            });
+        }
+
+        // Gérer l'input manuel
+        function handleScanInput(value) {
+            state.scanInput = value;
+            render();
+        }
+
+        // Gérer Enter manuel
+        function handleScanKeyPress(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                const code = state.scanInput.trim().toUpperCase();
+                
+                if (code) {
+                    console.log('📝 Saisie manuelle:', code);
+                    handleScan(code);
+                    state.scanInput = '';
+                    render();
+                    setTimeout(() => {
+                        const input = document.getElementById('scanInput');
+                        if (input) {
+                            input.value = '';
+                            input.focus();
+                        }
+                    }, 100);
+                }
+            }
+        }
+
+        // Démarrer la caméra
+        async function startCamera() {
+            try {
+                stopCamera(); // Arrêter toute caméra existante
+
+                const video = document.getElementById('cameraVideo');
+                if (!video) {
+                    setTimeout(startCamera, 200);
+                    return;
+                }
+
+                // Demander l'accès à la caméra arrière
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        facingMode: { ideal: 'environment' },
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 }
+                    }
+                });
+
+                video.srcObject = stream;
+                state.cameraStream = stream;
+
+                // Attendre que la vidéo soit prête
+                video.onloadedmetadata = async () => {
+                    await video.play();
+                    state.isCameraActive = true;
+                    render();
+                    
+                    // Initialiser le lecteur de code-barres ZXing
+                    const codeReader = new ZXing.BrowserMultiFormatReader();
+                    state.codeReader = codeReader;
+
+                    console.log('🎥 Caméra activée, scan en cours...');
+
+                    // Utiliser BrowserMultiFormatReader avec hints pour meilleure performance
+                    const hints = new Map();
+                    const formats = [
+                        ZXing.BarcodeFormat.CODE_128,
+                        ZXing.BarcodeFormat.CODE_39,
+                        ZXing.BarcodeFormat.EAN_13,
+                        ZXing.BarcodeFormat.EAN_8,
+                        ZXing.BarcodeFormat.QR_CODE
+                    ];
+                    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+                    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+                    // Variables pour éviter les scans répétés du même code
+                    let lastScannedCode = '';
+                    let lastScanTime = 0;
+
+                    // Scanner en continu sans arrêter la caméra
+                    try {
+                        codeReader.decodeFromVideoDevice(null, 'cameraVideo', (result, err) => {
+                            if (result) {
+                                const code = result.text.trim().toUpperCase();
+                                const currentTime = Date.now();
+                                
+                                // Éviter de scanner le même code plusieurs fois rapidement
+                                if (code !== lastScannedCode || currentTime - lastScanTime > 2000) {
+                                    console.log('📦 Code détecté:', code);
+                                    
+                                    // Afficher tous les codes détectés
+                                    const codeDisplay = document.getElementById('detectedCode');
+                                    if (codeDisplay) {
+                                        codeDisplay.textContent = `Détecté: ${code}`;
+                                        codeDisplay.className = 'bg-blue-500 text-white border-2 border-blue-700 rounded-lg p-3 text-center font-bold mb-2 shadow-lg';
+                                    }
+                                    
+                                    // Vérifier le format et scanner
+                                    if (/[A-Z]\d{7}[A-Z]{2}/.test(code)) {
+                                        handleScan(code);
+                                        lastScannedCode = code;
+                                        lastScanTime = currentTime;
+                                    } else {
+                                        showNotification(`Code: ${code}`, 'warning');
+                                    }
+                                    // La caméra continue de scanner automatiquement
+                                }
+                            }
+                            if (err && err.name !== 'NotFoundException') {
+                                console.log('Scan en cours...', err.name);
+                            }
+                        });
+                    } catch (error) {
+                        console.error('Erreur décodage:', error);
+                    }
+                };
+
+            } catch (error) {
+                console.error('Erreur caméra:', error);
+                showNotification('❌ Accès caméra refusé - Autorisez dans les paramètres', 'error');
+                state.scanMode = 'keyboard';
+                render();
+            }
+        }
+
+        // Arrêter la caméra
+        function stopCamera() {
+            if (state.cameraStream) {
+                state.cameraStream.getTracks().forEach(track => track.stop());
+                state.cameraStream = null;
+            }
+            
+            if (state.codeReader) {
+                try {
+                    state.codeReader.reset();
+                } catch (e) {
+                    // Ignorer les erreurs de reset
+                }
+                state.codeReader = null;
+            }
+
+            const video = document.getElementById('cameraVideo');
+            if (video) {
+                video.srcObject = null;
+            }
+
+            state.isCameraActive = false;
+        }
+
+        // Changer le mode de scan
+        function changeScanMode(mode) {
+            if (state.scanMode === mode) return;
+            
+            stopCamera();
+            state.scanMode = mode;
+            render();
+
+            if (mode === 'camera') {
+                setTimeout(() => startCamera(), 100);
+            }
+        }
+
+        // Réinitialiser
+        function resetAll() {
+            if (confirm('Voulez-vous vraiment réinitialiser ?')) {
+                stopCamera();
+                
+                state = {
+                    referenceOrders: [],
+                    scannedOrders: new Set(),
+                    uploadedFiles: [],
+                    currentView: 'import',
+                    scanMode: 'keyboard',
+                    scanInput: '',
+                    lastScanned: '',
+                    isProcessing: false,
+                    dragActive: false,
+                    isCameraActive: false,
+                    cameraStream: null,
+                    codeReader: null,
+                    scanBuffer: '',
+                    lastKeyTime: 0,
+                    continuousScan: true,
+                    douchetteMode: true,
+                    storeGroups: {},
+                    scanQueue: []
+                };
+                showNotification('✅ Réinitialisé', 'success');
+                render();
+            }
+        }
+
+        // Exporter CSV
+        function exportCSV() {
+            const headers = ['Code Suivi', 'Statut'];
+            const rows = state.referenceOrders.map(code => [
+                code,
+                state.scannedOrders.has(code) ? 'Scanné' : 'À scanner'
+            ]);
+            
+            const csv = [headers, ...rows].map(row => row.join(',')).join('\n');
+            const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `commandes_${new Date().toISOString().split('T')[0]}.csv`;
+            link.click();
+        }
+
+        // Render principal
+        function render() {
+            const totalOrders = state.referenceOrders.length;
+            const totalScanned = state.scannedOrders.size;
+            const totalRemaining = totalOrders - totalScanned;
+            const progressPercent = totalOrders > 0 ? Math.round((totalScanned / totalOrders) * 100) : 0;
+            const remainingOrders = state.referenceOrders.filter(code => !state.scannedOrders.has(code));
+
+            const app = document.getElementById('app');
+            app.innerHTML = `
+                <div class="max-w-7xl mx-auto p-4">
+                    <!-- Header -->
+                    <div class="bg-white rounded-3xl shadow-2xl p-6 mb-4 fade-in">
+                        <h1 class="text-3xl font-black text-gray-800 mb-4 text-center">
+                            🚀 DIGYLOG SCANNER
+                        </h1>
+
+                        ${state.referenceOrders.length > 0 ? `
+                            <!-- Navigation -->
+                            <div class="flex gap-2 justify-center mb-6">
+                                <button onclick="changeView('import')" class="flex items-center gap-2 px-6 py-3 rounded-xl font-bold transition-all ${
+                                    state.currentView === 'import' 
+                                        ? 'bg-purple-600 text-white scale-105' 
+                                        : 'bg-gray-200 text-gray-700'
+                                }">
+                                    📁 Import
+                                </button>
+                                <button onclick="changeView('scan')" class="flex items-center gap-2 px-6 py-3 rounded-xl font-bold transition-all ${
+                                    state.currentView === 'scan' 
+                                        ? 'bg-blue-600 text-white scale-105' 
+                                        : 'bg-gray-200 text-gray-700'
+                                }">
+                                    📸 Scanner
+                                </button>
+                            </div>
+
+                            <!-- Stats -->
+                            <div class="grid grid-cols-3 gap-3 mb-4">
+                                <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl p-4 text-white">
+                                    <p class="text-xs font-medium mb-1">Total</p>
+                                    <p class="text-3xl font-black">${totalOrders}</p>
+                                </div>
+                                <div class="bg-gradient-to-br from-green-500 to-green-600 rounded-2xl p-4 text-white">
+                                    <p class="text-xs font-medium mb-1">Scannées</p>
+                                    <p class="text-3xl font-black">${totalScanned}</p>
+                                </div>
+                                <div class="bg-gradient-to-br from-orange-500 to-orange-600 rounded-2xl p-4 text-white">
+                                    <p class="text-xs font-medium mb-1">Restantes</p>
+                                    <p class="text-3xl font-black">${totalRemaining}</p>
+                                </div>
+                            </div>
+
+                            <!-- Progress -->
+                            <div class="bg-gray-200 rounded-full h-6 overflow-hidden mb-4">
+                                <div class="bg-gradient-to-r from-green-400 to-green-600 h-full flex items-center justify-center text-white font-bold text-sm transition-all duration-500" style="width: ${progressPercent}%">
+                                    ${progressPercent}%
+                                </div>
+                            </div>
+
+                            <div class="flex gap-2 justify-center">
+                                <button onclick="exportCSV()" class="px-4 py-2 bg-green-600 text-white rounded-xl font-bold">
+                                    📥 Exporter
+                                </button>
+                                <button onclick="resetAll()" class="px-4 py-2 bg-red-600 text-white rounded-xl font-bold">
+                                    🗑️ Réinitialiser
+                                </button>
+                            </div>
+                        ` : ''}
+                    </div>
+
+                    ${state.currentView === 'import' ? `
+                        <!-- Import View -->
+                        <div class="bg-white rounded-3xl shadow-2xl p-6 fade-in">
+                            <h2 class="text-2xl font-black text-gray-800 mb-4 text-center">
+                                📁 IMPORT DE FICHIERS
+                            </h2>
+
+                            <div class="border-4 border-dashed border-gray-300 rounded-2xl p-8 text-center mb-4" 
+                                 onclick="document.getElementById('fileInput').click()">
+                                <div class="text-6xl mb-4">📤</div>
+                                <p class="text-xl font-bold text-gray-700 mb-2">
+                                    ${state.isProcessing ? 'Traitement...' : 'Cliquez pour importer'}
+                                </p>
+                                <p class="text-sm text-gray-500">PDF, CSV ou TXT</p>
+                            </div>
+
+                            <input type="file" id="fileInput" multiple accept=".pdf,.csv,.txt" class="hidden" 
+                                   onchange="handleFileInput(event)">
+
+                            <button onclick="loadSampleData()" 
+                                    class="w-full py-4 bg-indigo-600 text-white rounded-xl font-bold text-lg">
+                                📦 Charger Exemple
+                            </button>
+
+                            ${state.uploadedFiles.length > 0 ? `
+                                <div class="mt-6">
+                                    <h3 class="text-lg font-bold text-gray-800 mb-3">
+                                        Fichiers importés (${state.uploadedFiles.length})
+                                    </h3>
+                                    ${state.uploadedFiles.map(file => `
+                                        <div class="bg-gray-100 rounded-lg p-3 mb-2 flex justify-between items-center">
+                                            <div>
+                                                <p class="font-semibold text-sm">${file.name}</p>
+                                                <p class="text-xs text-gray-600">${file.count} commandes</p>
+                                            </div>
+                                            <span class="text-green-600 text-2xl">✓</span>
+                                        </div>
+                                    `).join('')}
+                                    
+                                    ${Object.keys(state.storeGroups).length > 0 ? `
+                                        <div class="mt-4 bg-blue-50 border-2 border-blue-300 rounded-xl p-4">
+                                            <p class="font-bold text-blue-800 mb-2">📊 Répartition par expéditeur</p>
+                                            ${Object.entries(state.storeGroups).map(([store, orders]) => `
+                                                <div class="flex justify-between items-center py-2 border-b border-blue-200 last:border-0">
+                                                    <span class="text-blue-900 font-semibold">${store}</span>
+                                                    <span class="bg-blue-200 text-blue-900 px-3 py-1 rounded-full text-sm font-bold">
+                                                        ${orders.length} tickets
+                                                    </span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            ` : ''}
+                        </div>
+                    ` : ''}
+
+                    ${state.currentView === 'scan' && state.referenceOrders.length > 0 ? `
+                        <!-- Scan View -->
+                        <div class="bg-white rounded-3xl shadow-2xl p-6 mb-4 fade-in">
+                            <h2 class="text-2xl font-black text-gray-800 mb-6 text-center">
+                                📸 ZONE DE SCAN
+                            </h2>
+
+                            <!-- Mode Selection -->
+                            <div class="flex gap-2 justify-center mb-6">
+                                <button onclick="changeScanMode('keyboard')" class="flex items-center gap-2 px-6 py-3 rounded-xl font-bold transition-all ${
+                                    state.scanMode === 'keyboard' 
+                                        ? 'bg-blue-600 text-white scale-105' 
+                                        : 'bg-gray-200 text-gray-700'
+                                }">
+                                    ⌨️ Clavier
+                                </button>
+                                <button onclick="changeScanMode('camera')" class="flex items-center gap-2 px-6 py-3 rounded-xl font-bold transition-all ${
+                                    state.scanMode === 'camera' 
+                                        ? 'bg-blue-600 text-white scale-105' 
+                                        : 'bg-gray-200 text-gray-700'
+                                }">
+                                    📷 Caméra
+                                </button>
+                            </div>
+
+                            ${state.scanMode === 'keyboard' ? `
+                                <!-- Mode Douchette activé -->
+                                ${state.douchetteMode ? `
+                                    <div class="bg-green-50 border-2 border-green-500 rounded-xl p-4 mb-4">
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex items-center gap-3">
+                                                <div class="bg-green-500 text-white rounded-full w-12 h-12 flex items-center justify-center text-2xl">
+                                                    🔌
+                                                </div>
+                                                <div>
+                                                    <p class="font-bold text-green-800">Mode douchette activé</p>
+                                                    <p class="text-sm text-green-700">Latence minimale - Priorité débit</p>
+                                                </div>
+                                            </div>
+                                            <button onclick="toggleDouchetteMode()" class="px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg font-bold text-sm">
+                                                Désactiver
+                                            </button>
+                                        </div>
+                                    </div>
+                                ` : `
+                                    <div class="bg-blue-50 border-2 border-blue-300 rounded-xl p-4 mb-4">
+                                        <p class="text-center text-blue-800 mb-2">
+                                            💡 <strong>Conseil :</strong> Activez le mode douchette pour des scans en chaîne plus rapides
+                                        </p>
+                                        <button onclick="toggleDouchetteMode()" class="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold">
+                                            Activer le mode douchette
+                                        </button>
+                                    </div>
+                                `}
+
+                                <div class="bg-gradient-to-br from-blue-50 to-indigo-50 border-4 border-blue-500 rounded-2xl p-8 mb-4">
+                                    <div class="flex items-center justify-center gap-3 mb-4">
+                                        <div class="text-6xl">📦</div>
+                                        <div class="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
+                                    </div>
+                                    <p class="text-xl font-bold text-gray-700 mb-2 text-center">
+                                        ${state.douchetteMode ? 'Douchette connectée — Prêt à scanner' : 'Scannez directement !'}
+                                    </p>
+                                    <p class="text-sm text-gray-600 mb-4 text-center">
+                                        Le code s'affichera automatiquement
+                                    </p>
+                                    <input 
+                                        type="text" 
+                                        id="scanInput"
+                                        value="${state.scanInput}"
+                                        placeholder="${state.douchetteMode ? 'Scan ultra-rapide activé...' : 'Scan automatique activé...'}"
+                                        class="w-full px-6 py-4 text-2xl font-mono font-bold text-center border-4 border-blue-400 rounded-xl focus:border-blue-600 focus:outline-none bg-white"
+                                        oninput="handleScanInput(this.value)"
+                                        onkeypress="handleScanKeyPress(event)"
+                                        autocomplete="off"
+                                    >
+                                    <div class="mt-6 bg-green-100 border-2 border-green-500 rounded-lg p-4">
+                                        <p class="text-green-800 font-bold text-center">
+                                            ✅ Détection automatique ${state.douchetteMode ? 'ultra-rapide' : ''} activée
+                                        </p>
+                                        <p class="text-green-700 text-sm text-center mt-2">
+                                            ${state.douchetteMode 
+                                                ? 'Mode optimisé pour scan en chaîne - Débit maximal' 
+                                                : 'Scannez n\'importe où - Le code sera capturé automatiquement'}
+                                        </p>
+                                    </div>
+                                </div>
+                            ` : ''}
+
+                            ${state.scanMode === 'camera' ? `
+                                <!-- Scan continu caméra -->
+                                <div class="bg-purple-50 border-2 border-purple-500 rounded-xl p-4 mb-4">
+                                    <div class="flex items-center justify-between">
+                                        <div class="flex items-center gap-3">
+                                            <div class="bg-purple-500 text-white rounded-full w-12 h-12 flex items-center justify-center text-2xl">
+                                                📹
+                                            </div>
+                                            <div>
+                                                <p class="font-bold text-purple-800">Scan continu ${state.continuousScan ? 'activé' : 'désactivé'}</p>
+                                                <p class="text-sm text-purple-700">Détection automatique sans rechargement</p>
+                                            </div>
+                                        </div>
+                                        <button onclick="toggleContinuousScan()" class="px-4 py-2 ${state.continuousScan ? 'bg-red-500 hover:bg-red-600' : 'bg-green-500 hover:bg-green-600'} text-white rounded-lg font-bold text-sm">
+                                            ${state.continuousScan ? 'Désactiver' : 'Activer'}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="relative bg-black rounded-2xl overflow-hidden mb-4" style="aspect-ratio: 4/3;">
+                                    <video 
+                                        id="cameraVideo" 
+                                        autoplay 
+                                        playsinline 
+                                        class="w-full h-full"
+                                    ></video>
+                                    <div class="viewfinder">
+                                        <div class="corner corner-tl"></div>
+                                        <div class="corner corner-tr"></div>
+                                        <div class="corner corner-bl"></div>
+                                        <div class="corner corner-br"></div>
+                                        <div class="absolute w-full h-1 bg-green-500 opacity-75 scan-line"></div>
+                                    </div>
+                                    <!-- Zone d'affichage du code détecté -->
+                                    <div class="absolute top-4 left-4 right-4">
+                                        <div id="detectedCode" class="hidden"></div>
+                                    </div>
+                                    ${!state.isCameraActive ? `
+                                        <div class="absolute inset-0 flex items-center justify-center bg-black bg-opacity-75">
+                                            <div class="text-white text-center">
+                                                <div class="text-6xl mb-4 animate-pulse">📷</div>
+                                                <p class="text-xl font-bold">Activation de la caméra...</p>
+                                                <p class="text-sm mt-2">Autorisez l'accès si demandé</p>
+                                            </div>
+                                        </div>
+                                    ` : `
+                                        <div class="absolute bottom-4 left-0 right-0 text-center">
+                                            <div class="bg-green-500 text-white px-4 py-2 rounded-full inline-block font-bold text-sm">
+                                                🎥 Scan continu actif - Mode ultra-rapide
+                                            </div>
+                                        </div>
+                                    `}
+                                </div>
+                                <div class="bg-blue-50 border-2 border-blue-300 rounded-lg p-3 mb-4 text-center">
+                                    <p class="text-sm text-blue-800">
+                                        💡 <strong>Aide :</strong> Positionnez le code-barres dans le cadre vert pour une détection optimale
+                                    </p>
+                                </div>
+                                <p class="text-center text-sm text-gray-600 mb-4">
+                                    📱 Scan continu : détection automatique sans rechargement<br>
+                                    <span class="text-xs">Plusieurs codes consécutifs seront traités en file</span>
+                                </p>
+                            ` : ''}
+
+                            ${state.lastScanned ? `
+                                <div class="bg-green-100 border-2 border-green-500 rounded-xl p-4 text-center fade-in">
+                                    <p class="text-green-800 font-bold text-lg">
+                                        Dernier: <span class="font-mono">${state.lastScanned}</span>
+                                    </p>
+                                </div>
+                            ` : ''}
+                        </div>
+
+                        ${remainingOrders.length > 0 ? `
+                            <div class="bg-white rounded-3xl shadow-2xl p-6 fade-in">
+                                <h2 class="text-xl font-black text-gray-800 mb-4 flex items-center gap-2">
+                                    ⚠️ Restantes (${remainingOrders.length})
+                                </h2>
+                                <div class="grid grid-cols-2 gap-2">
+                                    ${remainingOrders.map(code => `
+                                        <div class="bg-gradient-to-br from-orange-50 to-red-50 border-2 border-orange-300 rounded-xl p-3 text-center">
+                                            <p class="font-mono font-bold text-base">${code}</p>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        ` : `
+                            <div class="bg-gradient-to-br from-green-400 to-green-500 rounded-3xl shadow-2xl p-12 text-center text-white fade-in">
+                                <div class="text-8xl mb-4">🎉</div>
+                                <h2 class="text-4xl font-black mb-2">TERMINÉ !</h2>
+                                <p class="text-xl font-bold">Toutes les commandes scannées</p>
+                            </div>
+                        `}
+                    ` : ''}
+                </div>
+            `;
+
+            // Focus sur l'input si en mode clavier
+            if (state.currentView === 'scan' && state.scanMode === 'keyboard') {
+                setTimeout(() => {
+                    const input = document.getElementById('scanInput');
+                    if (input) input.focus();
+                }, 100);
+            }
+        }
+
+        // Toggle mode douchette
+        function toggleDouchetteMode() {
+            state.douchetteMode = !state.douchetteMode;
+            if (state.douchetteMode) {
+                showNotification('✅ Mode douchette activé - Débit maximal', 'success');
+            } else {
+                showNotification('ℹ️ Mode douchette désactivé', 'warning');
+            }
+            render();
+        }
+
+        // Toggle scan continu caméra
+        function toggleContinuousScan() {
+            state.continuousScan = !state.continuousScan;
+            if (state.continuousScan) {
+                showNotification('✅ Scan continu activé - La caméra reste active', 'success');
+            } else {
+                showNotification('⏸️ Scan continu désactivé - Scan manuel uniquement', 'warning');
+            }
+            render();
+        }
+
+        // Event handlers globaux
+        function changeView(view) {
+            if (view !== state.currentView) {
+                stopCamera();
+            }
+            state.currentView = view;
+            render();
+        }
+
+        function handleFileInput(event) {
+            handleFiles(event.target.files);
+        }
+
+        // Initialisation
+        window.addEventListener('load', () => {
+            initBarcodeScanner(); // Initialiser le listener du scanner
+            render();
+        });
+
+        // Nettoyage à la fermeture
+        window.addEventListener('beforeunload', () => {
+            stopCamera();
+        });
+    </script>
+</body>
+</html>
